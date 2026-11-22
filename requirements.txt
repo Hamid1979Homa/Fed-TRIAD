@@ -1,4 +1,7 @@
-# versions used to produce the results in this repository (Python 3.13)
+# Exact versions used to produce the results in this repository (Python 3.13; these versions need Python >= 3.12).
+# With these versions the checks of the README pass and the numbers agree with the reference to the tolerance
+# stated in README.md ("Reproducibility"). Other versions have not been tested: the code is expected to run with
+# them, but scikit-learn's k-means can change between versions, so the numbers may then differ.
 numpy==2.5.3
 scipy==1.18.1
 scikit-learn==1.9.1
