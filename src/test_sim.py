@@ -34,17 +34,14 @@ def bit_identical(r, ref):
     return all(np.array_equal(r['excess'][v], ref['excess'][v]) for v in fs.VARIANTS)
 
 
-# 1. The extension must not change any method of the first study (seed 1, drift, m=12).
-#    Floating-point results are bit-identical only on the same CPU / BLAS / library versions; on another machine they
-#    differ in the last digits. The check therefore uses a relative tolerance of 1e-5 on the paper's metric. Measured
-#    machine-to-machine differences are <= 2e-7 (README); a 1e-3 change of kappa changes the metric by up to 5e-2.
+# 1. Compare seed 1 with the historical study. The smoke test uses a tolerance, while
+#    reproduce.py checks the entire archive at the documented precision.
 ref = np.load(sys.argv[1], allow_pickle=True).item()[1]
 cfg = dict(fs.CFG)
 r = fs.run(1, cfg, 12)
 check(f'seed 1 reproduces the stored first-study excess risk (mean of the last 20 rounds, relative tolerance {RTOL:g}) '
       'of all 12 variants', same_as_stored(r, ref))
-print(f'INFO  curves bit-identical to the stored ones on this machine: {bit_identical(r, ref)} '
-      '(True only on the machine that produced the stored results; False is expected elsewhere)')
+print(f'INFO  curves bit-identical to the stored ones in this environment: {bit_identical(r, ref)}')
 bad = dict(cfg, kappa=cfg['kappa'] + 1e-3)                       # planted fault
 check('control: a 1e-3 change of kappa breaks the reproduction (expected FAIL -> recorded as PASS if it fails)',
       not same_as_stored(fs.run(1, bad, 12), ref))

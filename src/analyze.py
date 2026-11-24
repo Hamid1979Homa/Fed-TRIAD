@@ -9,6 +9,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+from paper_tables import write_tables
 
 RES, OUT = sys.argv[1], sys.argv[2]
 os.makedirs(OUT, exist_ok=True)
@@ -78,8 +79,12 @@ def summarise(R, with_diag=True):
     return d
 
 
-def label(k, n=10, need=8):
-    return 'better' if k >= need else ('worse' if n - k >= need else 'no consistent difference')
+def label(lower, higher, need=8):
+    if lower >= need:
+        return 'better'
+    if higher >= need:
+        return 'worse'
+    return 'no consistent difference'
 
 
 def paired(R, a, b):
@@ -108,15 +113,16 @@ for k in SENS:
         TRIAD=smry['TRIAD']['final'], static=smry['TRIAD-static']['final'], oracle=smry['TRIAD-oracle']['final'],
         PC=smry['PC-gate']['final'], Ditto=smry['Ditto']['final'],
         best_competitor=best, best_value=smry[best]['final'], diff_vs_best=ms(diff),
-        seeds_better_than_best=k_best, label_vs_best=label(k_best),
-        seeds_better_than_static=k_static, label_vs_static=label(k_static),
-        seeds_better_than_PC=k_pc, label_vs_PC=label(k_pc),
-        seeds_better_than_Ditto=k_ditto, label_vs_Ditto=label(k_ditto),
+        seeds_better_than_best=k_best, label_vs_best=label(k_best, paired(R, best, 'TRIAD')),
+        seeds_better_than_static=k_static, label_vs_static=label(k_static, paired(R, 'TRIAD-static', 'TRIAD')),
+        seeds_better_than_PC=k_pc, label_vs_PC=label(k_pc, paired(R, 'PC-gate', 'TRIAD')),
+        seeds_better_than_Ditto=k_ditto, label_vs_Ditto=label(k_ditto, paired(R, 'Ditto', 'TRIAD')),
         J=smry['_J'], ari_adapt=smry['_ari_adapt_final'], ari_static=smry['_ari_static_final'],
         slope_TRIAD=smry['TRIAD']['slope_last50'], slope_static=smry['TRIAD-static']['slope_last50'],
         recluster_jumps=smry['_recluster_jumps'])
 num['_sens'] = sens
 json.dump(num, open(f'{OUT}/numbers.json', 'w'), indent=1)
+write_tables(num, OUT)
 
 # ---------------------------------------------------------------- figures (drift, m=12)
 R = runs['drift_m12']; seeds = sorted(R)

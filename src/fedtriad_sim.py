@@ -6,11 +6,13 @@ k-means + silhouette reclustering with hysteresis, Hungarian relabelling and
 cluster-model transfer, and a stale-client rule. Multi-output (q=3) linear-Gaussian data
 with a persistent concept shift at round tau that puts three concepts into one static cluster.
 
-Usage: python fedtriad_sim.py --seeds 1 2 3 4 5 --m 12 --out results_m12.npz
+Usage: python fedtriad_sim.py --seeds 1 2 3 4 5 --m 12 --out results_m12.npy
 """
 import argparse
 import json
+import math
 import time
+from pathlib import Path
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -20,10 +22,11 @@ from sklearn.metrics import adjusted_rand_score, silhouette_score
 CFG = dict(
     N=30, d=8, q=3, T=200, tau=100, n_path=60, n_gate=30, n_test=2000,
     noise=0.5, kappa=0.6, omega=0.6,
-    E=5, batch=16, lr=0.05, ridge=1e-3, lr_g=0.5, E_g=10, reg_g=1e-2,
+    E=5, batch=16, lr=0.05, ridge=1e-3, lr_g=0.5, E_g=10, reg_g=1e-2, eta=1.0,
     t0=20, W=10, A_max=20, tau_imp=0.02, K_max=8,
     s=8,                       # number of clients that change concept at tau (first half -> 2, rest -> new 4)
     ditto_lams=(0.1, 1.0, 10.0),
+    match_cluster_batches=False,
 )
 
 VARIANTS = {
@@ -108,11 +111,14 @@ def ditto_sgd(V0, Gm, F, Y, c, rng, lam):
     return V
 
 
-def local_sgd(W0, F, Y, c, rng, steps=None):
+def local_sgd(W0, F, Y, c, rng, steps=None, *, batches=None):
     """E steps of minibatch SGD on 0.5*||W f - y||^2 + 0.5*ridge*||W||^2."""
     W = W0.copy()
-    for _ in range(steps or c['E']):
+    for step in range(c['E'] if steps is None else steps):
         idx = rng.choice(len(F), size=min(c['batch'], len(F)), replace=False)
+        if batches is not None:
+            # Keep the original random stream on the matched-minibatch control.
+            idx = batches[step]
         Fb, Yb = F[idx], Y[idx]
         G = (Fb @ W.T - Yb).T @ Fb / len(idx) + c['ridge'] * W
         W -= c['lr'] * G
@@ -156,21 +162,26 @@ class ClusterRegime:
 
 
 def kmeans_labels(Z, K, seed):
-    return KMeans(n_clusters=K, n_init=10, random_state=seed).fit_predict(Z)
+    return KMeans(n_clusters=K, init='k-means++', n_init=10, algorithm='lloyd',
+                  max_iter=300, tol=1e-4, random_state=seed).fit_predict(Z)
 
 
 def algorithm3(Z, cur_labels, K_cur, cfg, seed, initial=False):
     """Adaptive cluster reassignment: candidates K-1, K, K+1 (or 2..6 at initialisation);
     quality = silhouette; accept only if it beats the current partition by tau_imp."""
-    if initial:
-        Ks = range(2, 7)
-        q_cur = -np.inf
-    else:
-        Ks = [k for k in (K_cur - 1, K_cur, K_cur + 1) if 2 <= k <= min(cfg['K_max'], len(Z) - 1)]
-        q_cur = silhouette_score(Z, cur_labels) if len(np.unique(cur_labels)) > 1 else -np.inf
+    if len(Z) < 3:
+        return cur_labels, -np.inf, False
+    candidates = range(2, 7) if initial else (K_cur - 1, K_cur, K_cur + 1)
+    upper = min(cfg['K_max'], len(Z) - 1, len(np.unique(Z, axis=0)))
+    cur_count = len(np.unique(cur_labels))
+    q_cur = silhouette_score(Z, cur_labels) if not initial and 1 < cur_count < len(Z) else -np.inf
     best = (-np.inf, None)
-    for K in Ks:
+    for K in candidates:
+        if not 2 <= K <= upper:
+            continue
         lab = kmeans_labels(Z, K, seed)
+        if not 1 < len(np.unique(lab)) < len(Z):
+            continue
         q = silhouette_score(Z, lab)
         if q > best[0]:
             best = (q, lab)
@@ -181,7 +192,7 @@ def algorithm3(Z, cur_labels, K_cur, cfg, seed, initial=False):
 
 
 def softmax_masked(Z, mask):
-    Z = np.where(mask[None, :] > 0, Z, -1e9)
+    Z = np.where(mask[None, :] > 0, Z, -np.inf)
     Z = Z - Z.max(1, keepdims=True)
     A = np.exp(Z) * mask[None, :]
     return A / A.sum(1, keepdims=True)
@@ -196,7 +207,7 @@ def gate_weights(gtype, params, S, mask):
 
 
 def gate_step(gtype, params, S, Fpaths, Y, mask, cfg):
-    """GD on mean ||sum_j a_j f_j - y||^2 with paths frozen (stop-gradient)."""
+    """GD on mean squared routed loss plus (reg_g/2)*||params||^2."""
     for _ in range(cfg['E_g']):
         A = gate_weights(gtype, params, S, mask)                   # n x 3
         R = np.einsum('nj,njq->nq', A, Fpaths) - Y                 # n x q
@@ -211,7 +222,8 @@ def gate_step(gtype, params, S, Fpaths, Y, mask, cfg):
 
 
 def run(seed, cfg, m):
-    c = cfg
+    c = dict(CFG, **cfg)
+    validate_config(c, m, [seed])
     world = World(seed, c)
     rng = np.random.default_rng(10_000 + seed)
     N, q, p = c['N'], c['q'], world.p
@@ -225,6 +237,9 @@ def run(seed, cfg, m):
     for v, (mask, reg, gt) in VARIANTS.items():
         for i in range(N):
             gates[v][i] = np.zeros(3) if gt == 'const' else np.zeros((3, 3))
+    masks = {v: np.array(mask, float) for v, (mask, _, _) in VARIANTS.items()}
+    evaluation_weights = {v: [None] * N for v in VARIANTS}
+    cluster_rng = np.random.default_rng(0) if c['match_cluster_batches'] else None
     T = c['T']
     names = list(VARIANTS) + ['Ditto']
     excess = {v: np.zeros(T) for v in names}
@@ -241,6 +256,8 @@ def run(seed, cfg, m):
     for t in range(T):
         # ---------- oracle regime: instant re-partition at tau (new cluster starts from global)
         if t == c['tau']:
+            for weights in evaluation_weights.values():
+                weights[:] = [None] * N
             reg = regimes['oracle']
             new = world.true_partition(t) - 1
             for k in np.unique(new):
@@ -256,10 +273,17 @@ def run(seed, cfg, m):
             P[i] = local_sgd(P[i], D['Fp'], D['Yp'], c, rng)
             last_seen[i] = t
             dG.append(local_sgd(G, D['Fp'], D['Yp'], c, rng) - G)
+            batches = None
+            if cluster_rng is not None:
+                cluster_rng.bit_generator.state = rng.bit_generator.state
+                n = len(D['Fp'])
+                batches = [cluster_rng.choice(n, size=min(c['batch'], n), replace=False)
+                           for _ in range(c['E'])]
             for k, reg in regimes.items():
                 lab = reg.labels[i]
                 dC[k].setdefault(lab, []).append(
-                    local_sgd(reg.models[lab], D['Fp'], D['Yp'], c, rng) - reg.models[lab])
+                    local_sgd(reg.models[lab], D['Fp'], D['Yp'], c, rng,
+                              batches=batches) - reg.models[lab])
             # Ditto personal models (received global G), lambda chosen on the held-out gate split
             hold = []
             for l in lams:
@@ -277,12 +301,13 @@ def run(seed, cfg, m):
                 Cm = regimes[rname].models[regimes[rname].labels[i]] if rname else np.zeros((q, p))
                 Fpaths = np.stack([Fg @ P[i].T, Fg @ Cm.T, Fg @ G.T], 1)
                 gates[v][i] = gate_step(gt, gates[v][i], D['Sg'], Fpaths, D['Yg'],
-                                        np.array(mask, float), c)
-        # ---------- server aggregation (Algorithm 1): simple averages = unbiased under uniform sampling
-        G = G + np.mean(dG, 0)
+                                        masks[v], c)
+                evaluation_weights[v][i] = None
+        # The sample average estimates the full-population mean of the local deltas.
+        G = G + c['eta'] * np.mean(dG, 0)
         for k, reg in regimes.items():
             for lab, ds in dC[k].items():
-                reg.models[lab] = reg.models[lab] + np.mean(ds, 0)
+                reg.models[lab] = reg.models[lab] + c['eta'] * np.mean(ds, 0)
         # ---------- reclustering (Algorithm 3)
         cta = 0.0
         if t == c['t0'] or (t > c['t0'] and (t - c['t0']) % c['W'] == 0):
@@ -319,18 +344,26 @@ def run(seed, cfg, m):
         ari_adapt[t] = adjusted_rand_score(truth, regimes['adaptive'].labels)
         ari_static[t] = adjusted_rand_score(truth, regimes['static'].labels)
         K_adapt[t] = len(np.unique(regimes['adaptive'].labels))
-        # ---------- evaluation: exact excess risk E||f_i(x) - m_i(x)||^2 on 2000 fresh inputs
+        # Estimate excess risk on held-out inputs drawn once per client and phase.
         per_client = {v: np.zeros(N) for v in names}
         for i in range(N):
             D = world.data(t, i)
             Ft = D['Ft']
             base = {'P': Ft @ P[i].T, 'G': Ft @ G.T}
             Cpred = {k: Ft @ reg.models[reg.labels[i]].T for k, reg in regimes.items()}
+            paths = {}
             for v, (mask, rname, gt) in VARIANTS.items():
                 Cp = Cpred[rname] if rname else np.zeros_like(base['P'])
-                Fpaths = np.stack([base['P'], Cp, base['G']], 1)
-                A = gate_weights(gt, gates[v][i], D['St'], np.array(mask, float))
-                pred = np.einsum('nj,njq->nq', A, Fpaths)
+                if sum(mask) == 1:
+                    pred = (base['P'], Cp, base['G'])[mask.index(1)]
+                else:
+                    if rname not in paths:
+                        paths[rname] = np.stack([base['P'], Cp, base['G']], 1)
+                    A = evaluation_weights[v][i]
+                    if A is None:
+                        A = gate_weights(gt, gates[v][i], D['St'], masks[v])
+                        evaluation_weights[v][i] = A
+                    pred = np.einsum('nj,njq->nq', A, paths[rname])
                 per_client[v][i] = np.mean(np.sum((pred - D['Mt']) ** 2, 1))
             Vsel = Vd[lams[lam_sel[i]]][i]
             per_client['Ditto'][i] = np.mean(np.sum((Ft @ Vsel.T - D['Mt']) ** 2, 1))
@@ -340,6 +373,8 @@ def run(seed, cfg, m):
 
     # ---------- Theorem 2 / Theorem 5 diagnostics on the final TRIAD paths (fresh evaluation data)
     diag = theorem_diagnostics(world, P, G, regimes['adaptive'], gates['TRIAD'], c, rng)
+    if any(not np.isfinite(curve).all() for curve in excess.values()):
+        raise ValueError('The run produced a non-finite risk. Check the step sizes and data scales.')
     out = dict(excess=excess, worst=worst_client, ari_adapt=ari_adapt, ari_static=ari_static,
                K_adapt=K_adapt, cta_round=cta_round, recluster_rounds=recluster_rounds,
                n_reclusters=regimes['adaptive'].n_reclusters,
@@ -378,7 +413,6 @@ def theorem_diagnostics(world, P, G, reg, gate_params, c, rng, n_fit=4000, n_eva
     independent sample. Also the Thm 5 pointwise bound with M(x) = d d^T + s^2 q 11^T."""
     res = {k: [] for k in ('learned', 'qp', 'diag', 'uniform', 'best_single',
                            'thm5_ratio', 'thm5_holds', 'mean_offdiag_corr')}
-    t = c['T'] - 1
     edges = np.quantile(rng.normal(size=100000), np.linspace(0, 1, nbins + 1))
     edges[0], edges[-1] = -np.inf, np.inf
     for i in range(c['N']):
@@ -399,10 +433,14 @@ def theorem_diagnostics(world, P, G, reg, gate_params, c, rng, n_fit=4000, n_eva
             Rb = Rf[bf == b]
             Mb = np.einsum('njq,nkq->jk', Rb, Rb) / len(Rb)
             rules['qp'][b] = simplex_qp(Mb)
-            iv = 1 / np.diag(Mb); rules['diag'][b] = iv / iv.sum()
+            diag = np.diag(Mb)
+            iv = (diag == 0).astype(float) if np.any(diag == 0) else 1 / diag
+            rules['diag'][b] = iv / iv.sum()
             rules['uniform'][b] = np.ones(3) / 3
             e = np.zeros(3); e[np.argmin(np.diag(Mb))] = 1; rules['best_single'][b] = e
-            sd = np.sqrt(np.diag(Mb)); Cr = Mb / np.outer(sd, sd)
+            sd = np.sqrt(diag)
+            scale = np.outer(sd, sd)
+            Cr = np.divide(Mb, scale, out=np.zeros_like(Mb), where=scale > 0)
             corrs.append(Cr[~np.eye(3, dtype=bool)].mean())
         for k, A in rules.items():
             pred = np.einsum('nj,njq->nq', A[be], Fe)
@@ -420,7 +458,7 @@ def theorem_diagnostics(world, P, G, reg, gate_params, c, rng, n_fit=4000, n_eva
         lhs = np.einsum('nj,njk,nk->n', Ag, Mx, Ag)
         rhs = off_max + (diag_max - off_max) * g2
         res['thm5_holds'].append(bool(np.all(lhs <= rhs + 1e-9)))
-        res['thm5_ratio'].append(float(lhs.mean() / rhs.mean()))
+        res['thm5_ratio'].append(float(lhs.mean() / rhs.mean()) if rhs.mean() else 0.0)
         res['mean_offdiag_corr'].append(float(np.mean(corrs)))
     return {k: np.array(v) for k, v in res.items()}
 
@@ -433,27 +471,76 @@ def q_noise(c):
     return c['q'] * c['noise'] ** 2
 
 
+def parse_overrides(values):
+    overrides = {}
+    for item in values:
+        key, equal, value = item.partition('=')
+        if not equal or key not in CFG or key in overrides:
+            raise ValueError(f'Use each known parameter once as name=value: {item!r}')
+        try:
+            overrides[key] = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f'{key} requires a JSON number, list, or boolean') from exc
+    return overrides
+
+
+def validate_config(cfg, m, seeds):
+    for key, default in CFG.items():
+        value = cfg[key]
+        if type(default) is int and type(value) is not int:
+            raise ValueError(f'{key} must be an integer')
+        if type(default) is bool and type(value) is not bool:
+            raise ValueError(f'{key} must be true or false')
+        if type(default) is float and (type(value) not in (int, float) or not math.isfinite(value) or value < 0):
+            raise ValueError(f'{key} must be a finite nonnegative number')
+    if cfg['N'] != 30 or not 1 <= m <= cfg['N']:
+        raise ValueError('This data generator uses 30 clients. Set m between 1 and 30.')
+    if not (0 <= cfg['tau'] < cfg['T'] and 0 <= cfg['t0'] < cfg['T']):
+        raise ValueError('Require 0 <= tau,t0 < T')
+    for key in ('d', 'q', 'n_path', 'n_gate', 'n_test', 'batch', 'W', 'E'):
+        if cfg[key] < 1:
+            raise ValueError(f'{key} must be at least 1')
+    if not 0 <= cfg['s'] <= 12 or min(cfg['E_g'], cfg['A_max']) < 0 or cfg['K_max'] < 2:
+        raise ValueError('Require 0 <= s <= 12, E_g and A_max >= 0, and K_max >= 2')
+    lams = cfg['ditto_lams']
+    if (not isinstance(lams, (list, tuple)) or not lams
+            or any(type(x) not in (int, float) or not math.isfinite(x) or x < 0 for x in lams)
+            or len(set(lams)) != len(lams)):
+        raise ValueError('ditto_lams must be a nonempty list of distinct, finite nonnegative numbers')
+    if len(set(seeds)) != len(seeds) or not all(0 <= seed < 2**32 for seed in seeds):
+        raise ValueError('Use distinct integer seeds in [0, 2**32)')
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--seeds', type=int, nargs='+', default=[1, 2, 3, 4, 5])
     ap.add_argument('--m', type=int, default=12)
-    ap.add_argument('--out', default='results.npz')
+    ap.add_argument('--out', default='results.npy', type=Path)
     ap.add_argument('--scenario', default='drift', choices=['drift', 'scarce'])
-    ap.add_argument('--set', nargs='*', default=[], help='overrides, e.g. kappa=1.0 s=4 tau_imp=0.05')
+    ap.add_argument('--set', nargs='+', default=[], help='e.g. kappa=1.0 s=4 match_cluster_batches=true')
     a = ap.parse_args()
-    CFG.update(scenario_overrides(a.scenario))
-    for kv in a.set:
-        k, v = kv.split('=')
-        CFG[k] = type(CFG[k])(float(v)) if not isinstance(CFG[k], tuple) else CFG[k]
+    cfg = dict(CFG)
+    try:
+        cfg.update(scenario_overrides(a.scenario))
+        cfg.update(parse_overrides(a.set))
+        validate_config(cfg, a.m, a.seeds)
+    except ValueError as exc:
+        ap.error(str(exc))
+    out = a.out if a.out.suffix == '.npy' else Path(str(a.out) + '.npy')
+    config = out.with_suffix('.cfg.json')
+    if out.exists() or config.exists():
+        ap.error(f'{out} or its configuration already exists. Choose a fresh path.')
+    out.parent.mkdir(parents=True, exist_ok=True)
     allres = {}
     for s in a.seeds:
         t0 = time.time()
-        r = run(s, CFG, a.m)
+        r = run(s, cfg, a.m)
         allres[s] = r
         print(f"seed {s}: done in {time.time() - t0:.1f}s; reclusters={r['n_reclusters']} "
               f"static_K={r['static_K']} final_ARI_adapt={r['ari_adapt'][-1]:.3f} "
               f"final_ARI_static={r['ari_static'][-1]:.3f}", flush=True)
         for v in list(VARIANTS) + ['Ditto']:
             print(f"   {v:14s} final excess {r['excess'][v][-20:].mean():.4f}", flush=True)
-    np.save(a.out, allres, allow_pickle=True)
-    json.dump(dict(CFG=CFG, m=a.m, seeds=a.seeds, scenario=a.scenario), open(a.out + '.cfg.json', 'w'))
+    np.save(out, allres, allow_pickle=True)
+    config.write_text(json.dumps(dict(CFG=cfg, m=a.m, seeds=a.seeds, scenario=a.scenario),
+                                 indent=2) + '\n', encoding='utf-8')

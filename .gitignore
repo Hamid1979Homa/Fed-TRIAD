@@ -5,5 +5,7 @@ __pycache__/
 venv/
 # per-seed intermediate files written by run_sweep.py (the combined per-setting files are kept)
 results/runs/
+reproduced/
+exploration/
 *.tmp.npy
 .DS_Store
